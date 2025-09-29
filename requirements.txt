@@ -33,3 +33,6 @@ traitlets==5.14.3
 tzdata==2025.1
 urllib3==2.3.0
 wcwidth==0.2.13
+langchain-core==0.2.9
+langchain-openai==0.1.23
+openai==1.58.1

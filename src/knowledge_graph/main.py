@@ -10,84 +10,62 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from src.knowledge_graph.config import load_config
-from src.knowledge_graph.llm import call_llm, extract_json_from_text
+from src.knowledge_graph.llm import LLMService, extract_json_from_text, service_from_config
 from src.knowledge_graph.visualization import visualize_knowledge_graph, sample_data_visualization
 from src.knowledge_graph.text_utils import chunk_text
 from src.knowledge_graph.entity_standardization import standardize_entities, infer_relationships, limit_predicate_length
-from src.knowledge_graph.prompts import MAIN_SYSTEM_PROMPT, MAIN_USER_PROMPT
+from src.knowledge_graph.prompts import TRIPLE_EXTRACTION_PROMPT
 
-def process_with_llm(config, input_text, debug=False):
-    """
-    Process input text with LLM to extract triples.
-    
-    Args:
-        config: Configuration dictionary
-        input_text: Text to analyze
-        debug: If True, print detailed debug information
-        
-    Returns:
-        List of extracted triples or None if processing failed
-    """
-    # Use prompts from the prompts module
-    system_prompt = MAIN_SYSTEM_PROMPT
-    user_prompt = MAIN_USER_PROMPT
-    user_prompt += f"```\n{input_text}```\n" 
+def process_with_llm(llm_service: LLMService, input_text: str, debug: bool = False):
+    """Process input text with the LLM service to extract triples."""
 
-    # LLM configuration
-    model = config["llm"]["model"]
-    api_key = config["llm"]["api_key"]
-    max_tokens = config["llm"]["max_tokens"]
-    temperature = config["llm"]["temperature"]
-    base_url = config["llm"]["base_url"]
-    
-    # Process with LLM
-    metadata = {}
-    response = call_llm(model, user_prompt, api_key, system_prompt, max_tokens, temperature, base_url)
-    
-    # Print raw response only if debug mode is on
-    if debug:
-        print("Raw LLM response:")
-        print(response)
-        print("\n---\n")
-    
-    # Extract JSON from the response
+    try:
+        response = llm_service.invoke(
+            TRIPLE_EXTRACTION_PROMPT.name,
+            {"input_text": input_text},
+            debug=debug,
+        )
+    except Exception as exc:
+        print(f"Error while invoking LLM: {exc}")
+        return None
+
     result = extract_json_from_text(response)
-    
-    if result:
-        # Validate and filter triples to ensure they have all required fields
-        valid_triples = []
-        invalid_count = 0
-        
-        for item in result:
-            if isinstance(item, dict) and "subject" in item and "predicate" in item and "object" in item:
-                # Add metadata to valid items
-                valid_triples.append(dict(item, **metadata))
-            else:
-                invalid_count += 1
-        
-        if invalid_count > 0:
-            print(f"Warning: Filtered out {invalid_count} invalid triples missing required fields")
-        
-        if not valid_triples:
-            print("Error: No valid triples found in LLM response")
-            return None
-        
-        # Apply predicate length limit to all valid triples
-        for triple in valid_triples:
-            triple["predicate"] = limit_predicate_length(triple["predicate"])
-        
-        # Print extracted JSON only if debug mode is on
-        if debug:
-            print("Extracted JSON:")
-            print(json.dumps(valid_triples, indent=2))  # Pretty print the JSON
-        
-        return valid_triples
-    else:
-        # Always print error messages even if debug is off
+
+    if not result:
         print("\n\nERROR ### Could not extract valid JSON from response: ", response, "\n\n")
         return None
 
-def process_text_in_chunks(config, full_text, debug=False):
+    valid_triples = []
+    invalid_count = 0
+
+    for item in result:
+        if isinstance(item, dict) and {"subject", "predicate", "object"}.issubset(item):
+            valid_triples.append(dict(item))
+        else:
+            invalid_count += 1
+
+    if invalid_count > 0:
+        print(f"Warning: Filtered out {invalid_count} invalid triples missing required fields")
+
+    if not valid_triples:
+        print("Error: No valid triples found in LLM response")
+        return None
+
+    for triple in valid_triples:
+        triple["predicate"] = limit_predicate_length(triple["predicate"])
+
+    if debug:
+        print("Extracted JSON:")
+        print(json.dumps(valid_triples, indent=2))
+
+    return valid_triples
+
+def process_text_in_chunks(
+    config,
+    full_text: str,
+    llm_service: LLMService,
+    debug: bool = False,
+):
     """
     Process a large text by breaking it into chunks with overlap,
     and then processing each chunk separately.
@@ -118,7 +96,7 @@ def process_text_in_chunks(config, full_text, debug=False):
         print(f"Processing chunk {i+1}/{len(text_chunks)} ({len(chunk.split())} words)")
         
         # Process the chunk with LLM
-        chunk_results = process_with_llm(config, chunk, debug)
+        chunk_results = process_with_llm(llm_service, chunk, debug)
         
         if chunk_results:
             # Add chunk information to each triple
@@ -139,7 +117,7 @@ def process_text_in_chunks(config, full_text, debug=False):
         print("="*50)
         print(f"Starting with {len(all_results)} triples and {len(get_unique_entities(all_results))} unique entities")
         
-        all_results = standardize_entities(all_results, config)
+        all_results = standardize_entities(all_results, config, llm_service=llm_service, debug=debug)
         
         print(f"After standardization: {len(all_results)} triples and {len(get_unique_entities(all_results))} unique entities")
     
@@ -159,7 +137,7 @@ def process_text_in_chunks(config, full_text, debug=False):
         for pred, count in sorted(relationship_counts.items(), key=lambda x: x[1], reverse=True)[:5]:
             print(f"  - {pred}: {count} occurrences")
         
-        all_results = infer_relationships(all_results, config)
+        all_results = infer_relationships(all_results, config, llm_service=llm_service, debug=debug)
         
         # Count relationships after inference
         relationship_counts_after = {}
@@ -178,15 +156,8 @@ def process_text_in_chunks(config, full_text, debug=False):
     return all_results
 
 def get_unique_entities(triples):
-    """
-    Get the set of unique entities from the triples.
-    
-    Args:
-        triples: List of triple dictionaries
-        
-    Returns:
-        Set of unique entity names
-    """
+    """Return the set of unique entities contained in the triples."""
+
     entities = set()
     for triple in triples:
         if not isinstance(triple, dict):
@@ -225,6 +196,12 @@ def main():
         print(f"To view the visualization, open the following file in your browser:")
         print(f"file://{os.path.abspath(args.output)}")
         return
+
+    try:
+        llm_service = service_from_config(config)
+    except ValueError as exc:
+        print(f"Invalid LLM configuration: {exc}")
+        return
     
     # For normal processing, input file is required
     if not args.input:
@@ -248,7 +225,7 @@ def main():
         return
     
     # Process text in chunks
-    result = process_text_in_chunks(config, input_text, args.debug)
+    result = process_text_in_chunks(config, input_text, llm_service, debug=args.debug)
     
     if result:
         # Save the raw data as JSON for potential reuse
@@ -274,4 +251,4 @@ def main():
         print("Knowledge graph generation failed due to errors in LLM processing.")
 
 if __name__ == "__main__":
-    main() 
+    main()

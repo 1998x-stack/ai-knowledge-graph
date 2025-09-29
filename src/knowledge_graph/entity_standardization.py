@@ -1,17 +1,19 @@
 """Entity standardization and relationship inference for knowledge graphs."""
+
+from __future__ import annotations
+
 import re
 from collections import defaultdict
-from src.knowledge_graph.llm import call_llm
+from typing import Any, Dict, Iterable, List, Sequence, Set
+
+from src.knowledge_graph.llm import LLMService, extract_json_from_text
 from src.knowledge_graph.prompts import (
-    ENTITY_RESOLUTION_SYSTEM_PROMPT, 
-    get_entity_resolution_user_prompt,
-    RELATIONSHIP_INFERENCE_SYSTEM_PROMPT,
-    get_relationship_inference_user_prompt,
-    WITHIN_COMMUNITY_INFERENCE_SYSTEM_PROMPT,
-    get_within_community_inference_user_prompt
+    ENTITY_RESOLUTION_PROMPT,
+    RELATIONSHIP_INFERENCE_PROMPT,
+    WITHIN_COMMUNITY_INFERENCE_PROMPT,
 )
 
-def limit_predicate_length(predicate, max_words=3):
+def limit_predicate_length(predicate: str, max_words: int = 3) -> str:
     """
     Enforce a maximum word limit on predicates.
     
@@ -37,24 +39,20 @@ def limit_predicate_length(predicate, max_words=3):
     
     return shortened
 
-def standardize_entities(triples, config):
-    """
-    Standardize entity names across all triples.
-    
-    Args:
-        triples: List of dictionaries with 'subject', 'predicate', and 'object' keys
-        config: Configuration dictionary
-        
-    Returns:
-        List of triples with standardized entity names
-    """
+def standardize_entities(
+    triples: Sequence[Dict[str, Any]],
+    config: Dict[str, Any],
+    llm_service: LLMService | None = None,
+    debug: bool = False,
+) -> List[Dict[str, Any]]:
+    """Standardize entity names across all triples."""
     if not triples:
         return triples
     
     print("Standardizing entity names across all triples...")
     
     # Validate input triples to ensure they have the required fields
-    valid_triples = []
+    valid_triples: List[Dict[str, Any]] = []
     invalid_count = 0
     
     for triple in triples:
@@ -162,7 +160,7 @@ def standardize_entities(triples, config):
         standardized_entities[entity] = standard
     
     # 5. Apply standardization to all triples
-    standardized_triples = []
+    standardized_triples: List[Dict[str, Any]] = []
     for triple in valid_triples:
         subj_lower = triple["subject"].lower()
         obj_lower = triple["object"].lower()
@@ -177,7 +175,14 @@ def standardize_entities(triples, config):
     
     # 6. Optional: Use LLM to help with entity resolution for ambiguous cases
     if config.get("standardization", {}).get("use_llm_for_entities", False):
-        standardized_triples = _resolve_entities_with_llm(standardized_triples, config)
+        if llm_service is None:
+            print("LLM service unavailable; skipping LLM-based entity resolution")
+        else:
+            standardized_triples = _resolve_entities_with_llm(
+                standardized_triples,
+                llm_service,
+                debug=debug,
+            )
     
     # 7. Filter out self-referencing triples
     filtered_triples = [triple for triple in standardized_triples if triple["subject"] != triple["object"]]
@@ -187,24 +192,21 @@ def standardize_entities(triples, config):
     print(f"Standardized {len(all_entities)} entities into {len(set(standardized_entities.values()))} standard forms")
     return filtered_triples
 
-def infer_relationships(triples, config):
-    """
-    Infer additional relationships between entities to reduce isolated communities.
-    
-    Args:
-        triples: List of dictionaries with standardized entity names
-        config: Configuration dictionary
-        
-    Returns:
-        List of triples with additional inferred relationships
-    """
+def infer_relationships(
+    triples: Sequence[Dict[str, Any]],
+    config: Dict[str, Any],
+    llm_service: LLMService | None = None,
+    debug: bool = False,
+) -> List[Dict[str, Any]]:
+    """Infer additional relationships between entities to reduce isolated communities."""
+
     if not triples or len(triples) < 2:
-        return triples
+        return list(triples)
     
     print("Inferring additional relationships between entities...")
     
     # Validate input triples to ensure they have the required fields
-    valid_triples = []
+    valid_triples: List[Dict[str, Any]] = []
     invalid_count = 0
     
     for triple in triples:
@@ -234,19 +236,30 @@ def infer_relationships(triples, config):
     communities = _identify_communities(graph)
     print(f"Identified {len(communities)} disconnected communities in the graph")
     
-    new_triples = []
+    new_triples: List[Dict[str, Any]] = []
     
     # Use LLM to infer relationships between isolated communities if configured
     if config.get("inference", {}).get("use_llm_for_inference", True):
-        # Infer relationships between different communities
-        community_triples = _infer_relationships_with_llm(valid_triples, communities, config)
-        if community_triples:
-            new_triples.extend(community_triples)
-            
-        # Infer relationships within the same communities for semantically related entities
-        within_community_triples = _infer_within_community_relationships(valid_triples, communities, config)
-        if within_community_triples:
-            new_triples.extend(within_community_triples)
+        if llm_service is None:
+            print("LLM service unavailable; skipping LLM-based relationship inference")
+        else:
+            community_triples = _infer_relationships_with_llm(
+                valid_triples,
+                communities,
+                llm_service,
+                debug=debug,
+            )
+            if community_triples:
+                new_triples.extend(community_triples)
+
+            within_community_triples = _infer_within_community_relationships(
+                valid_triples,
+                communities,
+                llm_service,
+                debug=debug,
+            )
+            if within_community_triples:
+                new_triples.extend(within_community_triples)
     
     # Apply transitive inference rules
     transitive_triples = _apply_transitive_inference(valid_triples, graph)
@@ -381,186 +394,143 @@ def _deduplicate_triples(triples):
     
     return list(unique_triples.values())
 
-def _resolve_entities_with_llm(triples, config):
-    """
-    Use LLM to help resolve entity references and standardize entity names.
-    
-    Args:
-        triples: List of triples with potentially non-standardized entities
-        config: Configuration dictionary
-        
-    Returns:
-        List of triples with LLM-assisted entity standardization
-    """
-    # Extract all unique entities
-    all_entities = set()
+def _resolve_entities_with_llm(
+    triples: List[Dict[str, Any]],
+    llm_service: LLMService,
+    *,
+    debug: bool = False,
+) -> List[Dict[str, Any]]:
+    """Use an LLM chain to standardize ambiguous entity references."""
+
+    all_entities: Set[str] = set()
     for triple in triples:
         all_entities.add(triple["subject"])
         all_entities.add(triple["object"])
-    
-    # If there are too many entities, limit to the most frequent ones
+
     if len(all_entities) > 100:
-        # Count entity occurrences
-        entity_counts = defaultdict(int)
+        entity_counts: Dict[str, int] = defaultdict(int)
         for triple in triples:
             entity_counts[triple["subject"]] += 1
             entity_counts[triple["object"]] += 1
-        
-        # Keep only the top 100 most frequent entities
-        all_entities = {entity for entity, count in 
-                       sorted(entity_counts.items(), key=lambda x: -x[1])[:100]}
-    
-    # Prepare prompt for LLM
+        top_entities = sorted(entity_counts.items(), key=lambda item: -item[1])[:100]
+        all_entities = {entity for entity, _ in top_entities}
+
+    if not all_entities:
+        return triples
+
     entity_list = "\n".join(sorted(all_entities))
-    system_prompt = ENTITY_RESOLUTION_SYSTEM_PROMPT
-    user_prompt = get_entity_resolution_user_prompt(entity_list)
-    
+
     try:
-        # LLM configuration
-        model = config["llm"]["model"]
-        api_key = config["llm"]["api_key"]
-        max_tokens = config["llm"]["max_tokens"]
-        temperature = config["llm"]["temperature"]
-        base_url = config["llm"]["base_url"]
-        
-        # Call LLM
-        response = call_llm(model, user_prompt, api_key, system_prompt, max_tokens, temperature, base_url)
-        
-        # Extract JSON mapping
-        import json
-        from src.knowledge_graph.llm import extract_json_from_text
-        
-        entity_mapping = extract_json_from_text(response)
-        
-        if entity_mapping and isinstance(entity_mapping, dict):
-            # Apply the mapping to standardize entities
-            entity_to_standard = {}
-            for standard, variants in entity_mapping.items():
-                for variant in variants:
-                    entity_to_standard[variant] = standard
-                # Also map the standard form to itself
-                entity_to_standard[standard] = standard
-            
-            # Apply standardization to triples
-            for triple in triples:
-                triple["subject"] = entity_to_standard.get(triple["subject"], triple["subject"])
-                triple["object"] = entity_to_standard.get(triple["object"], triple["object"])
-                
-            print(f"Applied LLM-based entity standardization for {len(entity_mapping)} entity groups")
-        else:
-            print("Could not extract valid entity mapping from LLM response")
-    
-    except Exception as e:
-        print(f"Error in LLM-based entity resolution: {e}")
-    
+        response = llm_service.invoke(
+            ENTITY_RESOLUTION_PROMPT.name,
+            {"entity_list": entity_list},
+            debug=debug,
+        )
+    except Exception as exc:
+        print(f"Error in LLM-based entity resolution: {exc}")
+        return triples
+
+    entity_mapping = extract_json_from_text(response)
+
+    if not entity_mapping or not isinstance(entity_mapping, dict):
+        print("Could not extract valid entity mapping from LLM response")
+        return triples
+
+    entity_to_standard: Dict[str, str] = {}
+    for standard, variants in entity_mapping.items():
+        for variant in variants:
+            entity_to_standard[variant] = standard
+        entity_to_standard[standard] = standard
+
+    for triple in triples:
+        triple["subject"] = entity_to_standard.get(triple["subject"], triple["subject"])
+        triple["object"] = entity_to_standard.get(triple["object"], triple["object"])
+
+    print(f"Applied LLM-based entity standardization for {len(entity_mapping)} entity groups")
     return triples
 
-def _infer_relationships_with_llm(triples, communities, config):
-    """
-    Use LLM to infer relationships between disconnected communities.
-    
-    Args:
-        triples: List of existing triples
-        communities: List of community sets
-        config: Configuration dictionary
-        
-    Returns:
-        List of new inferred triples
-    """
-    # Skip if there's only one community
+def _infer_relationships_with_llm(
+    triples: Sequence[Dict[str, Any]],
+    communities: Sequence[Set[str]],
+    llm_service: LLMService,
+    *,
+    debug: bool = False,
+) -> List[Dict[str, Any]]:
+    """Use an LLM to infer relationships between disconnected communities."""
+
     if len(communities) <= 1:
         print("Only one community found, skipping LLM-based relationship inference")
         return []
-    
-    # Focus on the largest communities
+
     large_communities = sorted(communities, key=len, reverse=True)[:5]
-    
-    # For each pair of large communities, try to infer relationships
-    new_triples = []
-    
+    new_triples: List[Dict[str, Any]] = []
+
     for i, comm1 in enumerate(large_communities):
         for j, comm2 in enumerate(large_communities):
             if i >= j:
-                continue  # Skip self-comparisons and duplicates
+                continue
+
+            rep1 = list(comm1)[: min(5, len(comm1))]
+            rep2 = list(comm2)[: min(5, len(comm2))]
             
-            # Select representative entities from each community
-            rep1 = list(comm1)[:min(5, len(comm1))]
-            rep2 = list(comm2)[:min(5, len(comm2))]
-            
-            # Prepare relevant existing triples for context
-            context_triples = []
-            for triple in triples:
-                if triple["subject"] in rep1 or triple["subject"] in rep2 or \
-                   triple["object"] in rep1 or triple["object"] in rep2:
-                    context_triples.append(triple)
-            
-            # Limit context size
-            if len(context_triples) > 20:
-                context_triples = context_triples[:20]
-            
-            # Convert triples to text for prompt
-            triples_text = "\n".join([
-                f"{t['subject']} {t['predicate']} {t['object']}"
-                for t in context_triples
-            ])
-            
-            # Prepare entity lists
+            context_triples = [
+                triple
+                for triple in triples
+                if triple["subject"] in rep1
+                or triple["subject"] in rep2
+                or triple["object"] in rep1
+                or triple["object"] in rep2
+            ][:20]
+
+            triples_text = "\n".join(
+                f"{t['subject']} {t['predicate']} {t['object']}" for t in context_triples
+            )
+
             entities1 = ", ".join(rep1)
             entities2 = ", ".join(rep2)
-            
-            # Create prompt for LLM
-            system_prompt = RELATIONSHIP_INFERENCE_SYSTEM_PROMPT
-            user_prompt = get_relationship_inference_user_prompt(entities1, entities2, triples_text)
-            
-            try:
-                # LLM configuration
-                model = config["llm"]["model"]
-                api_key = config["llm"]["api_key"]
-                max_tokens = config["llm"]["max_tokens"]
-                temperature = config["llm"]["temperature"]
-                base_url = config["llm"]["base_url"]
-                
-                # Call LLM
-                response = call_llm(model, user_prompt, api_key, system_prompt, max_tokens, temperature, base_url)
-                
-                # Extract JSON results
-                from src.knowledge_graph.llm import extract_json_from_text
-                inferred_triples = extract_json_from_text(response)
-                
-                if inferred_triples and isinstance(inferred_triples, list):
-                    # Mark as inferred and add to new triples
-                    for triple in inferred_triples:
-                        if "subject" in triple and "predicate" in triple and "object" in triple:
-                            # Skip self-referencing triples
-                            if triple["subject"] == triple["object"]:
-                                continue
-                            triple["inferred"] = True
-                            triple["predicate"] = limit_predicate_length(triple["predicate"])
-                            new_triples.append(triple)
-                    
-                    print(f"Inferred {len(new_triples)} new relationships between communities")
-                else:
-                    print("Could not extract valid inferred relationships from LLM response")
-            
-            except Exception as e:
-                print(f"Error in LLM-based relationship inference: {e}")
-    
-    return new_triples 
 
-def _infer_within_community_relationships(triples, communities, config):
-    """
-    Use LLM to infer relationships between entities within the same community.
-    Focus on entities that might be semantically related but not directly connected.
-    
-    Args:
-        triples: List of existing triples
-        communities: List of community sets
-        config: Configuration dictionary
-        
-    Returns:
-        List of new inferred triples
-    """
-    new_triples = []
+            try:
+                response = llm_service.invoke(
+                    RELATIONSHIP_INFERENCE_PROMPT.name,
+                    {
+                        "entities1": entities1,
+                        "entities2": entities2,
+                        "triples_text": triples_text,
+                    },
+                    debug=debug,
+                )
+            except Exception as exc:
+                print(f"Error in LLM-based relationship inference: {exc}")
+                continue
+
+            inferred_triples = extract_json_from_text(response)
+
+            if not inferred_triples or not isinstance(inferred_triples, list):
+                print("Could not extract valid inferred relationships from LLM response")
+                continue
+
+            for triple in inferred_triples:
+                if {"subject", "predicate", "object"}.issubset(triple):
+                    if triple["subject"] == triple["object"]:
+                        continue
+                    triple["inferred"] = True
+                    triple["predicate"] = limit_predicate_length(triple["predicate"])
+                    new_triples.append(triple)
+
+            print(f"Inferred {len(inferred_triples)} new relationships between communities")
+
+    return new_triples
+
+def _infer_within_community_relationships(
+    triples: Sequence[Dict[str, Any]],
+    communities: Sequence[Set[str]],
+    llm_service: LLMService,
+    *,
+    debug: bool = False,
+) -> List[Dict[str, Any]]:
+    """Use an LLM to infer relationships within a community."""
+
+    new_triples: List[Dict[str, Any]] = []
     
     # Process larger communities
     for community in sorted(communities, key=len, reverse=True)[:3]:
@@ -622,43 +592,35 @@ def _infer_within_community_relationships(triples, communities, config):
         # Create pairs text
         pairs_text = "\n".join([f"{a} and {b}" for a, b in disconnected_pairs])
         
-        # Create prompt for LLM
-        system_prompt = WITHIN_COMMUNITY_INFERENCE_SYSTEM_PROMPT
-        user_prompt = get_within_community_inference_user_prompt(pairs_text, triples_text)
-        
         try:
-            # LLM configuration
-            model = config["llm"]["model"]
-            api_key = config["llm"]["api_key"]
-            max_tokens = config["llm"]["max_tokens"]
-            temperature = config["llm"]["temperature"]
-            base_url = config["llm"]["base_url"]
-            
-            # Call LLM
-            response = call_llm(model, user_prompt, api_key, system_prompt, max_tokens, temperature, base_url)
-            
-            # Extract JSON results
-            from src.knowledge_graph.llm import extract_json_from_text
-            inferred_triples = extract_json_from_text(response)
-            
-            if inferred_triples and isinstance(inferred_triples, list):
-                # Mark as inferred and add to new triples
-                for triple in inferred_triples:
-                    if "subject" in triple and "predicate" in triple and "object" in triple:
-                        # Skip self-referencing triples
-                        if triple["subject"] == triple["object"]:
-                            continue
-                        triple["inferred"] = True
-                        triple["predicate"] = limit_predicate_length(triple["predicate"])
-                        new_triples.append(triple)
-                
-                print(f"Inferred {len(inferred_triples)} new relationships within communities")
-            else:
-                print("Could not extract valid inferred relationships from LLM response")
-        
-        except Exception as e:
-            print(f"Error in LLM-based relationship inference within communities: {e}")
-    
+            response = llm_service.invoke(
+                WITHIN_COMMUNITY_INFERENCE_PROMPT.name,
+                {
+                    "pairs_text": pairs_text,
+                    "triples_text": triples_text,
+                },
+                debug=debug,
+            )
+        except Exception as exc:
+            print(f"Error in LLM-based relationship inference within communities: {exc}")
+            continue
+
+        inferred_triples = extract_json_from_text(response)
+
+        if not inferred_triples or not isinstance(inferred_triples, list):
+            print("Could not extract valid inferred relationships from LLM response")
+            continue
+
+        for triple in inferred_triples:
+            if {"subject", "predicate", "object"}.issubset(triple):
+                if triple["subject"] == triple["object"]:
+                    continue
+                triple["inferred"] = True
+                triple["predicate"] = limit_predicate_length(triple["predicate"])
+                new_triples.append(triple)
+
+        print(f"Inferred {len(inferred_triples)} new relationships within communities")
+
     return new_triples
 
 def _infer_relationships_by_lexical_similarity(entities, triples):

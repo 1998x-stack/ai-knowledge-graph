@@ -277,7 +277,9 @@ flowchart TD
     G --> H[process_with_llm]
     
     %% LLM processing
-    H --> I[call_llm]
+    H --> I[LLMService]
+    I --> I1[PluggableChainFactory]
+    I --> I2[PromptRegistry]
     I --> J[extract_json_from_text]
     
     %% Entity standardization phase
@@ -313,7 +315,7 @@ flowchart TD
     F --> W[JSON Data Export]
     
     %% Prompts usage
-    Y[prompts.py] --> H
+    Y[prompts.py] --> I2
     Y --> L1
     Y --> N2
     Y --> N3
